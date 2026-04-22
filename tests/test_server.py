@@ -1,10 +1,13 @@
-"""Tests for video-mcp MCP server."""
+"""Tests for video-mcp MCP server.
+
+Phase 2a.2: End-to-end tests updated to mock the google-genai SDK.
+"""
 
 from __future__ import annotations
 
 import json
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -136,8 +139,8 @@ class TestInputModelsValidate:
         assert "super-secret-key-12345" not in repr(inp)
 
     def test_video_job_status_input_minimal(self) -> None:
-        inp = VideoJobStatusInput(job_id="stub_veo_standard_abc123")
-        assert inp.job_id == "stub_veo_standard_abc123"
+        inp = VideoJobStatusInput(job_id="models/veo-3.1-standard/operations/test-job")
+        assert inp.job_id == "models/veo-3.1-standard/operations/test-job"
         assert inp.output_format == OutputFormat.MARKDOWN
 
     def test_video_job_status_input_json_format(self) -> None:
@@ -161,15 +164,111 @@ class TestInputModelsValidate:
         assert OutputFormat.JSON.value == "json"
 
 
-class TestGenerateVideoEndToEndStubbed:
-    """End-to-end: generate_video → get_job_status, stub path, no real API."""
+@pytest.fixture
+def mock_veo_sdk(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Mock the google-genai SDK globals for server-level end-to-end tests.
 
-    async def test_full_stub_cycle_markdown(self) -> None:
+    Returns the mock ``genai.Client`` instance.
+    """
+    import src.providers.veo_provider as veo_mod
+
+    class FakeAPIError(Exception):
+        def __init__(self, code: int = 500, message: str = "error"):
+            self.code = code
+            self.message = message
+            self.response = None
+            super().__init__(f"{code}: {message}")
+
+    class FakeClientError(FakeAPIError):
+        pass
+
+    class FakeServerError(FakeAPIError):
+        pass
+
+    mock_client = MagicMock()
+    mock_genai = MagicMock()
+    mock_genai.Client.return_value = mock_client
+
+    mock_types = MagicMock()
+    mock_errors = MagicMock()
+    mock_errors.APIError = FakeAPIError
+    mock_errors.ClientError = FakeClientError
+    mock_errors.ServerError = FakeServerError
+
+    monkeypatch.setattr(veo_mod, "genai", mock_genai)
+    monkeypatch.setattr(veo_mod, "genai_types", mock_types)
+    monkeypatch.setattr(veo_mod, "genai_errors", mock_errors)
+    monkeypatch.setattr(veo_mod, "_import_dependencies", lambda: None)
+
+    return mock_client
+
+
+class TestGenerateVideoEndToEndStubbed:
+    """End-to-end: generate_video → get_job_status with mocked SDK."""
+
+    async def test_full_stub_cycle_markdown(
+        self, mock_veo_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Calls generate_video, extracts job_id, polls get_job_status to completion."""
+        import asyncio
+
         from src.providers.base import JobStore  # type: ignore
         from src.server import generate_video, get_job_status  # type: ignore
 
         JobStore.clear()
+
+        # --- Set up mock operations ---
+        mock_submitted_op = MagicMock()
+        mock_submitted_op.name = "models/veo-3.1-standard/operations/e2e-test-abc"
+
+        mock_pending_op = MagicMock()
+        mock_pending_op.done = False
+        mock_pending_op.error = None
+        mock_pending_op.metadata = None
+
+        # Build a mocked "write" so we don't hit disk
+        write_calls: list = []
+
+        async def _mock_write(data: bytes, output_path, filename_hint: str):
+            write_calls.append(filename_hint)
+            from pathlib import Path  # noqa: PLC0415
+
+            return Path("/mocked/output/e2e-video.mp4")
+
+        mock_video = MagicMock()
+        mock_video.video_bytes = b"e2e-video-bytes"
+        mock_video.uri = None
+        mock_gen_video = MagicMock()
+        mock_gen_video.video = mock_video
+        mock_response = MagicMock()
+        mock_response.generated_videos = [mock_gen_video]
+
+        mock_done_op = MagicMock()
+        mock_done_op.done = True
+        mock_done_op.error = None
+        mock_done_op.response = mock_response
+        mock_done_op.result = None
+
+        # submit → pending → complete
+        call_seq: list[int] = [0]
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            count = call_seq[0]
+            call_seq[0] += 1
+            if count == 0:
+                # First call: generate_videos → returns submitted op
+                mock_veo_sdk.models.generate_videos.return_value = mock_submitted_op
+                return func(*args, **kwargs)
+            elif count == 1:
+                # Second call: operations.get → returns pending
+                mock_veo_sdk.operations.get.return_value = mock_pending_op
+                return func(*args, **kwargs)
+            else:
+                # Third call: operations.get → returns done
+                mock_veo_sdk.operations.get.return_value = mock_done_op
+                return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
 
         # Step 1: Submit
         gen_params = VideoGenerateInput(
@@ -179,41 +278,52 @@ class TestGenerateVideoEndToEndStubbed:
             aspect_ratio="16:9",
         )
 
-        fixed_time = 5_000_000.0
-
-        with patch("time.time", return_value=fixed_time):
-            submit_result = await generate_video(gen_params)
+        submit_result = await generate_video(gen_params)
 
         # Verify submit response contains a job_id
-        assert "stub_veo_standard_" in submit_result
         assert "Job ID" in submit_result or "job_id" in submit_result.lower()
+        assert "submitted" in submit_result.lower()
+        assert "models/veo-3.1-standard/operations/e2e-test-abc" in submit_result
 
-        # Extract job_id from the response (it's formatted as `stub_veo_standard_<hex>`)
-        import re
+        # Extract job_id from the response
+        job_id = "models/veo-3.1-standard/operations/e2e-test-abc"
 
-        match = re.search(r"stub_veo_standard_([a-f0-9]{12})", submit_result)
-        assert match is not None, f"Could not find job_id in response:\n{submit_result}"
-        job_id = f"stub_veo_standard_{match.group(1)}"
-
-        # Step 2: Poll — should be pending right after submit
+        # Step 2: Poll — should be pending
         status_params = VideoJobStatusInput(job_id=job_id)
-        with patch("time.time", return_value=fixed_time + 0.1):
-            pending_result = await get_job_status(status_params)
+        pending_result = await get_job_status(status_params)
         assert "pending" in pending_result.lower() or "submitted" in pending_result.lower()
 
-        # Step 3: Poll again after 3 seconds — should be complete
-        with patch("time.time", return_value=fixed_time + 3.0):
-            complete_result = await get_job_status(status_params)
+        # Step 3: Poll again — should be complete (with mocked write)
+        # Patch _write_video_bytes on the provider instance
+        from src.providers.registry import ProviderRegistry  # type: ignore
+
+        registry = ProviderRegistry()
+        provider = registry.get_provider("veo-3.1-standard")
+        monkeypatch.setattr(provider, "_write_video_bytes", _mock_write)
+
+        complete_result = await get_job_status(status_params)
         assert "complete" in complete_result.lower()
         assert job_id in complete_result
-        assert "stub.example.com" in complete_result
 
-    async def test_generate_video_json_output(self) -> None:
+    async def test_generate_video_json_output(
+        self, mock_veo_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """generate_video with JSON output returns parseable JSON."""
+        import asyncio
+
         from src.providers.base import JobStore  # type: ignore
         from src.server import generate_video  # type: ignore
 
         JobStore.clear()
+
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-fast/operations/json-test-xyz"
+        mock_veo_sdk.models.generate_videos.return_value = mock_operation
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
 
         gen_params = VideoGenerateInput(
             prompt="A slow-motion waterfall",
@@ -221,13 +331,11 @@ class TestGenerateVideoEndToEndStubbed:
             output_format=OutputFormat.JSON,
         )
 
-        fixed_time = 6_000_000.0
-        with patch("time.time", return_value=fixed_time):
-            result = await generate_video(gen_params)
+        result = await generate_video(gen_params)
 
         data = json.loads(result)
         assert "job_id" in data
-        assert data["job_id"].startswith("stub_veo_fast_")
+        assert data["job_id"] == "models/veo-3.1-fast/operations/json-test-xyz"
         assert data["status"] == "submitted"
         assert data["provider"] == "veo-3.1-fast"
 
@@ -266,21 +374,34 @@ class TestGenerateVideoEndToEndStubbed:
         result = await generate_video(gen_params)
         assert "D019" in result or "not implemented" in result.lower()
 
-    async def test_default_provider_is_veo_standard(self) -> None:
+    async def test_default_provider_is_veo_standard(
+        self, mock_veo_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """generate_video with no provider defaults to veo-3.1-standard."""
+        import asyncio
+
         from src.providers.base import JobStore  # type: ignore
         from src.server import generate_video  # type: ignore
 
         JobStore.clear()
+
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-standard/operations/default-test"
+        mock_veo_sdk.models.generate_videos.return_value = mock_operation
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
 
         gen_params = VideoGenerateInput(
             prompt="A mountain sunrise",
             output_format=OutputFormat.JSON,
         )
 
-        fixed_time = 7_000_000.0
-        with patch("time.time", return_value=fixed_time):
-            result = await generate_video(gen_params)
+        result = await generate_video(gen_params)
 
         data = json.loads(result)
         assert data["provider"] == "veo-3.1-standard"
+        assert "job_id" in data
+        assert data["status"] == "submitted"

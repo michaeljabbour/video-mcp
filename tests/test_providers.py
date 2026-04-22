@@ -1,25 +1,101 @@
-"""Tests for video provider implementations."""
+"""Tests for video provider implementations.
+
+Phase 2a.2: VeoProvider tests use mocked google-genai SDK.
+Sora/Grok stub tests remain unchanged.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import os
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
 # Set dummy API keys BEFORE any src imports so settings cache is populated correctly
 os.environ.setdefault("GEMINI_API_KEY", "test-key-gemini")
 
-from src.exceptions import JobNotFoundError  # type: ignore
+from src.exceptions import JobNotFoundError, ValidationError  # type: ignore
 from src.providers.base import JobStore, VideoCapabilities, VideoJobResult  # type: ignore
 from src.providers.grok_provider import GrokProvider  # type: ignore
 from src.providers.registry import ProviderRegistry  # type: ignore
 from src.providers.sora_provider import SoraProvider  # type: ignore
 from src.providers.veo_provider import VeoProvider  # type: ignore
 
-# ============================
-# Veo Provider Tests
-# ============================
+# ---------------------------------------------------------------------------
+# Shared test fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clear_job_store():
+    """Clear the JobStore before each test to avoid state leakage."""
+    JobStore.clear()
+    yield
+    JobStore.clear()
+
+
+@pytest.fixture
+def mock_sdk(monkeypatch):
+    """Replace lazy-loaded google-genai module globals with safe mocks.
+
+    Returns the mock ``genai.Client`` instance.  Tests should configure
+    ``mock_sdk.models.generate_videos.return_value`` etc. as needed.
+    """
+    import src.providers.veo_provider as veo_mod
+
+    # ---- Fake error classes so isinstance() checks work in _map_sdk_error ----
+    class FakeAPIError(Exception):
+        def __init__(self, code: int = 500, message: str = "error"):
+            self.code = code
+            self.message = message
+            self.response = None
+            super().__init__(f"{code}: {message}")
+
+    class FakeClientError(FakeAPIError):
+        pass
+
+    class FakeServerError(FakeAPIError):
+        pass
+
+    mock_client = MagicMock()
+    mock_genai = MagicMock()
+    mock_genai.Client.return_value = mock_client
+
+    mock_types = MagicMock()
+    mock_errors = MagicMock()
+    mock_errors.APIError = FakeAPIError
+    mock_errors.ClientError = FakeClientError
+    mock_errors.ServerError = FakeServerError
+
+    monkeypatch.setattr(veo_mod, "genai", mock_genai)
+    monkeypatch.setattr(veo_mod, "genai_types", mock_types)
+    monkeypatch.setattr(veo_mod, "genai_errors", mock_errors)
+    monkeypatch.setattr(veo_mod, "_import_dependencies", lambda: None)
+
+    return mock_client
+
+
+@pytest.fixture
+def sync_to_thread(monkeypatch):
+    """Replace asyncio.to_thread with a synchronous equivalent.
+
+    The veo_provider wraps synchronous SDK calls in asyncio.to_thread.
+    This fixture makes those calls run synchronously so tests can control
+    return values directly via mock_sdk.
+    """
+
+    async def _fake_to_thread(func, *args, **kwargs):
+        # Execute the callable synchronously (it's already mocked)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+
+
+# ---------------------------------------------------------------------------
+# Veo Provider — name and capabilities (no SDK involved)
+# ---------------------------------------------------------------------------
 
 
 class TestVeoProviderName:
@@ -79,111 +155,480 @@ class TestVeoCapabilitiesPopulated:
         assert len(caps.best_for) > 0
 
 
-class TestVeoSubmitReturnsJobId:
-    """submit() returns a VideoJobResult with the correct shape."""
+# ---------------------------------------------------------------------------
+# Veo Provider — submit() validation (no SDK involved)
+# ---------------------------------------------------------------------------
 
-    async def test_submit_returns_job_result(self) -> None:
-        provider = VeoProvider("standard")
-        result = await provider.submit("A serene mountain lake at golden hour")
-        assert isinstance(result, VideoJobResult)
-        assert result.job_id.startswith("stub_veo_standard_")
-        assert result.status == "submitted"
-        assert result.provider == "veo-3.1-standard"
-        assert result.model == "veo-3.1-standard"
-        assert result.submitted_at is not None
 
-    async def test_submit_registers_in_job_store(self) -> None:
-        provider = VeoProvider("fast")
-        result = await provider.submit("A product commercial")
-        assert JobStore.exists(result.job_id)
-        assert JobStore.get_provider_name(result.job_id) == "veo-3.1-fast"
+class TestVeoSubmitValidation:
+    """Input validation in submit() fires before any SDK call."""
 
     async def test_submit_validates_empty_prompt(self) -> None:
-        from src.exceptions import ValidationError  # type: ignore
-
         provider = VeoProvider("standard")
         with pytest.raises(ValidationError, match="empty"):
             await provider.submit("")
 
-    async def test_submit_uses_default_duration(self) -> None:
-        provider = VeoProvider("lite")
-        result = await provider.submit("A nature documentary scene")
-        assert result.duration_seconds == 8.0
-
-    async def test_submit_accepts_custom_duration(self) -> None:
-        provider = VeoProvider("standard")
-        result = await provider.submit("A short clip", duration=4.0)
-        assert result.duration_seconds == 4.0
-
     async def test_submit_rejects_invalid_duration(self) -> None:
-        from src.exceptions import ValidationError  # type: ignore
-
         provider = VeoProvider("standard")
         with pytest.raises(ValidationError, match="not supported"):
             await provider.submit("A clip", duration=7.0)
 
     async def test_submit_rejects_invalid_aspect_ratio(self) -> None:
-        from src.exceptions import ValidationError  # type: ignore
-
         provider = VeoProvider("standard")
         with pytest.raises(ValidationError, match="not supported"):
             await provider.submit("A clip", aspect_ratio="4:3")
 
 
-class TestVeoGetStatusPendingThenComplete:
-    """Stub advances pending → complete after the configured delay."""
+# ---------------------------------------------------------------------------
+# Veo Provider — submit() with mocked SDK
+# ---------------------------------------------------------------------------
 
-    async def test_status_pending_then_complete(self) -> None:
-        """Stub transitions: submitted → pending → complete after 2s."""
+
+class TestVeoSubmitWithSDK:
+    """VeoProvider.submit() calls google-genai and returns a valid job result."""
+
+    async def test_submit_returns_job_result(
+        self, mock_sdk: MagicMock, sync_to_thread: None
+    ) -> None:
+        """submit() returns VideoJobResult with status='submitted'."""
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-standard/operations/test-op-abc"
+        mock_sdk.models.generate_videos.return_value = mock_operation
+
         provider = VeoProvider("standard")
+        result = await provider.submit("A serene mountain lake at golden hour")
 
-        # Patch time.time to control the clock
-        fixed_time = 1_000_000.0
+        assert isinstance(result, VideoJobResult)
+        assert result.job_id == "models/veo-3.1-standard/operations/test-op-abc"
+        assert result.status == "submitted"
+        assert result.provider == "veo-3.1-standard"
+        assert result.model == "veo-3.1-standard"
+        assert result.submitted_at is not None
+        # SDK was called
+        mock_sdk.models.generate_videos.assert_called_once()
 
-        with patch("time.time", return_value=fixed_time):
-            result = await provider.submit("A cinematic landscape")
-            job_id = result.job_id
+    async def test_submit_registers_in_job_store(
+        self, mock_sdk: MagicMock, sync_to_thread: None
+    ) -> None:
+        """submit() registers the job in JobStore with provider name."""
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-fast/operations/fast-op-xyz"
+        mock_sdk.models.generate_videos.return_value = mock_operation
 
-        # Just after submission (0.5s later) → pending
-        with patch("time.time", return_value=fixed_time + 0.5):
-            status = await provider.get_status(job_id)
-        assert status.status == "pending"
-        assert status.progress is not None
-        assert 0.0 <= status.progress < 1.0
+        provider = VeoProvider("fast")
+        result = await provider.submit("A product commercial")
 
-        # After 2+ seconds → complete
-        with patch("time.time", return_value=fixed_time + 3.0):
-            status = await provider.get_status(job_id)
-        assert status.status == "complete"
-        assert status.progress == 1.0
-        assert status.output_url is not None
-        assert job_id in status.output_url
-        assert status.completed_at is not None
+        assert JobStore.exists(result.job_id)
+        assert JobStore.get_provider_name(result.job_id) == "veo-3.1-fast"
+        # Metadata should contain the operation_name for get_status()
+        meta = JobStore.get_metadata(result.job_id) or {}
+        assert meta.get("operation_name") == result.job_id
+
+    async def test_submit_uses_default_duration(
+        self, mock_sdk: MagicMock, sync_to_thread: None
+    ) -> None:
+        """submit() defaults to 8.0s when duration is omitted."""
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-lite/operations/lite-op-001"
+        mock_sdk.models.generate_videos.return_value = mock_operation
+
+        provider = VeoProvider("lite")
+        result = await provider.submit("A nature documentary scene")
+        assert result.duration_seconds == 8.0
+
+    async def test_submit_accepts_custom_duration(
+        self, mock_sdk: MagicMock, sync_to_thread: None
+    ) -> None:
+        """submit() accepts a valid custom duration."""
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-standard/operations/dur-op-004"
+        mock_sdk.models.generate_videos.return_value = mock_operation
+
+        provider = VeoProvider("standard")
+        result = await provider.submit("A short clip", duration=4.0)
+        assert result.duration_seconds == 4.0
+
+    async def test_submit_passes_model_key_to_sdk(
+        self, mock_sdk: MagicMock, sync_to_thread: None
+    ) -> None:
+        """submit() passes the tier model key as 'model' to generate_videos()."""
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-standard/operations/model-check"
+        mock_sdk.models.generate_videos.return_value = mock_operation
+
+        provider = VeoProvider("standard")
+        await provider.submit("Check model key")
+
+        call_kwargs = mock_sdk.models.generate_videos.call_args
+        assert call_kwargs is not None
+        assert call_kwargs.kwargs.get("model") == "veo-3.1-standard"
+
+    async def test_submit_auth_error_mapped_to_authentication_error(
+        self, mock_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AuthenticationError is raised on 401/403 SDK errors."""
+        import src.providers.veo_provider as veo_mod
+
+        class FakeClientError(Exception):
+            def __init__(self):
+                self.code = 403
+                self.message = "Forbidden"
+                self.response = None
+                super().__init__("403: Forbidden")
+
+        mock_sdk.models.generate_videos.side_effect = FakeClientError()
+        monkeypatch.setattr(veo_mod.genai_errors, "ClientError", FakeClientError)
+        monkeypatch.setattr(veo_mod.genai_errors, "APIError", Exception)
+        monkeypatch.setattr(veo_mod.genai_errors, "ServerError", Exception)
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+
+        from src.exceptions import AuthenticationError  # type: ignore
+
+        provider = VeoProvider("standard")
+        with pytest.raises(AuthenticationError):
+            await provider.submit("Test auth error")
+
+    async def test_submit_rate_limit_mapped_to_rate_limit_error(
+        self, mock_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """RateLimitError is raised on 429 SDK errors."""
+        import src.providers.veo_provider as veo_mod
+
+        class FakeClientError(Exception):
+            def __init__(self):
+                self.code = 429
+                self.message = "Too Many Requests"
+                self.response = None
+                super().__init__("429: Too Many Requests")
+
+        mock_sdk.models.generate_videos.side_effect = FakeClientError()
+        monkeypatch.setattr(veo_mod.genai_errors, "ClientError", FakeClientError)
+        monkeypatch.setattr(veo_mod.genai_errors, "APIError", Exception)
+        monkeypatch.setattr(veo_mod.genai_errors, "ServerError", Exception)
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+
+        from src.exceptions import RateLimitError  # type: ignore
+
+        provider = VeoProvider("standard")
+        with pytest.raises(RateLimitError):
+            await provider.submit("Test rate limit")
+
+
+# ---------------------------------------------------------------------------
+# Veo Provider — get_status() with mocked SDK
+# ---------------------------------------------------------------------------
+
+
+class TestVeoGetStatusWithSDK:
+    """VeoProvider.get_status() polls google-genai operations correctly."""
 
     async def test_get_status_unknown_job_raises(self) -> None:
+        """JobNotFoundError is raised for unknown job IDs (no SDK needed)."""
         provider = VeoProvider("standard")
         with pytest.raises(JobNotFoundError):
             await provider.get_status("nonexistent_job_id_xyz_abc")
 
-    async def test_complete_status_has_output_url(self) -> None:
-        provider = VeoProvider("lite")
-        fixed_time = 2_000_000.0
+    async def test_get_status_pending(
+        self, mock_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_status() returns status='pending' when operation is not done."""
+        mock_submitted_op = MagicMock()
+        mock_submitted_op.name = "models/veo-3.1-standard/operations/pending-job"
 
-        with patch("time.time", return_value=fixed_time):
-            result = await provider.submit("A timelapse")
-            job_id = result.job_id
+        mock_pending_op = MagicMock()
+        mock_pending_op.done = False
+        mock_pending_op.error = None
+        mock_pending_op.metadata = {"progressPercent": 30}
 
-        with patch("time.time", return_value=fixed_time + 10.0):
-            status = await provider.get_status(job_id)
+        calls: list[str] = []
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            result = func(*args, **kwargs)
+            calls.append("called")
+            return result
+
+        mock_sdk.models.generate_videos.return_value = mock_submitted_op
+        mock_sdk.operations.get.return_value = mock_pending_op
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+
+        provider = VeoProvider("standard")
+        submit_result = await provider.submit("A cinematic landscape")
+        job_id = submit_result.job_id
+
+        status = await provider.get_status(job_id)
+
+        assert status.status == "pending"
+        assert status.job_id == job_id
+        assert status.progress == pytest.approx(0.30)
+        mock_sdk.operations.get.assert_called_once()
+
+    async def test_get_status_complete(
+        self, mock_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_status() returns status='complete' when operation is done."""
+        mock_submitted_op = MagicMock()
+        mock_submitted_op.name = "models/veo-3.1-standard/operations/done-job"
+
+        # Build completed operation with inline video bytes
+        mock_video = MagicMock()
+        mock_video.video_bytes = b"fake-mp4-content"
+        mock_video.uri = None
+
+        mock_gen_video = MagicMock()
+        mock_gen_video.video = mock_video
+
+        mock_response = MagicMock()
+        mock_response.generated_videos = [mock_gen_video]
+
+        mock_done_op = MagicMock()
+        mock_done_op.done = True
+        mock_done_op.error = None
+        mock_done_op.response = mock_response
+        mock_done_op.result = None
+
+        mock_sdk.models.generate_videos.return_value = mock_submitted_op
+        mock_sdk.operations.get.return_value = mock_done_op
+
+        # Mock _write_video_bytes to avoid actual disk writes
+        captured_write_args: list[tuple] = []
+
+        async def _mock_write(data: bytes, output_path, filename_hint: str) -> Path:
+            captured_write_args.append((data, output_path, filename_hint))
+            return Path("/mocked/output/video.mp4")
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+
+        provider = VeoProvider("standard")
+        monkeypatch.setattr(provider, "_write_video_bytes", _mock_write)
+
+        submit_result = await provider.submit("A timelapse")
+        job_id = submit_result.job_id
+
+        status = await provider.get_status(job_id)
 
         assert status.status == "complete"
-        assert status.output_url is not None
-        assert status.output_url.endswith(".mp4")
+        assert status.progress == 1.0
+        assert status.output_url == "file:///mocked/output/video.mp4"
+        assert status.completed_at is not None
+        # Verify video bytes were written
+        assert len(captured_write_args) == 1
+        assert captured_write_args[0][0] == b"fake-mp4-content"
+
+    async def test_get_status_complete_with_uri(
+        self, mock_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_status() downloads via httpx when operation returns a URI (not bytes)."""
+        mock_submitted_op = MagicMock()
+        mock_submitted_op.name = "models/veo-3.1-fast/operations/uri-job"
+
+        mock_video = MagicMock()
+        mock_video.video_bytes = None
+        mock_video.uri = "https://storage.googleapis.com/fake-bucket/video.mp4"
+
+        mock_gen_video = MagicMock()
+        mock_gen_video.video = mock_video
+
+        mock_response = MagicMock()
+        mock_response.generated_videos = [mock_gen_video]
+
+        mock_done_op = MagicMock()
+        mock_done_op.done = True
+        mock_done_op.error = None
+        mock_done_op.response = mock_response
+        mock_done_op.result = None
+
+        mock_sdk.models.generate_videos.return_value = mock_submitted_op
+        mock_sdk.operations.get.return_value = mock_done_op
+
+        download_calls: list[str] = []
+        write_calls: list[bytes] = []
+
+        async def _mock_download(uri: str) -> bytes:
+            download_calls.append(uri)
+            return b"downloaded-bytes"
+
+        async def _mock_write(data: bytes, output_path, filename_hint: str) -> Path:
+            write_calls.append(data)
+            return Path("/mocked/output/uri-video.mp4")
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+
+        provider = VeoProvider("fast")
+        monkeypatch.setattr(provider, "_download_video_uri", _mock_download)
+        monkeypatch.setattr(provider, "_write_video_bytes", _mock_write)
+
+        submit_result = await provider.submit("Test URI download")
+        status = await provider.get_status(submit_result.job_id)
+
+        assert status.status == "complete"
+        assert len(download_calls) == 1
+        assert "googleapis.com" in download_calls[0]
+        assert len(write_calls) == 1
+        assert write_calls[0] == b"downloaded-bytes"
+
+    async def test_get_status_failed(
+        self, mock_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_status() returns status='failed' when operation has an error."""
+        mock_submitted_op = MagicMock()
+        mock_submitted_op.name = "models/veo-3.1-standard/operations/failed-job"
+
+        mock_failed_op = MagicMock()
+        mock_failed_op.done = True
+        mock_failed_op.error = {"code": 400, "message": "Invalid prompt"}
+        mock_failed_op.response = None
+        mock_failed_op.result = None
+
+        mock_sdk.models.generate_videos.return_value = mock_submitted_op
+        mock_sdk.operations.get.return_value = mock_failed_op
+
+        async def _fake_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
+
+        provider = VeoProvider("standard")
+        submit_result = await provider.submit("Problematic prompt")
+        status = await provider.get_status(submit_result.job_id)
+
+        assert status.status == "failed"
+        assert status.error_code == "400"
+        assert status.retry_hint is not None
 
 
-# ============================
-# Sora Provider Tests
-# ============================
+# ---------------------------------------------------------------------------
+# Veo Provider — D025 path validation (new tests per spec)
+# ---------------------------------------------------------------------------
+
+
+class TestVeoD025PathValidation:
+    """D025 path checks reject forbidden output locations."""
+
+    def test_veo_rejects_tmp_path(self) -> None:
+        """ValidationError with D025 reference is raised for /tmp paths."""
+        from src.providers.veo_provider import _check_d025  # type: ignore
+
+        with pytest.raises(ValidationError, match="D025"):
+            _check_d025(Path("/tmp/some/video.mp4"))
+
+    def test_veo_rejects_cache_path(self) -> None:
+        """ValidationError is raised for ~/.cache/ paths."""
+        from src.providers.veo_provider import _check_d025  # type: ignore
+
+        with pytest.raises(ValidationError, match="D025"):
+            _check_d025(Path.home() / ".cache" / "video.mp4")
+
+    def test_veo_rejects_amplifier_path(self) -> None:
+        """ValidationError is raised for ~/.amplifier/ paths."""
+        from src.providers.veo_provider import _check_d025  # type: ignore
+
+        with pytest.raises(ValidationError, match="D025"):
+            _check_d025(Path.home() / ".amplifier" / "video.mp4")
+
+    def test_veo_rejects_package_internal_path(self) -> None:
+        """ValidationError is raised for paths inside the package directory."""
+        from src.providers.veo_provider import _check_d025, _get_forbidden_prefixes  # type: ignore
+
+        prefixes = _get_forbidden_prefixes()
+        # The package root is one of the forbidden prefixes
+        # (it ends with 'src' directory which is the package root)
+        package_prefix = next(
+            (p for p in prefixes if "video-mcp" in p or "src" in p.split("/")[-1:]), None
+        )
+        if package_prefix is None:
+            # Skip if we can't identify package prefix in this env
+            pytest.skip("Could not identify package-root forbidden prefix")
+
+        with pytest.raises(ValidationError, match="D025"):
+            _check_d025(Path(package_prefix) / "providers" / "video.mp4")
+
+    def test_veo_rejects_forbidden_output_path(self) -> None:
+        """Combined: all four D025 forbidden locations raise ValidationError."""
+        from src.providers.veo_provider import _check_d025  # type: ignore
+
+        forbidden_paths = [
+            Path("/tmp/video.mp4"),
+            Path.home() / ".cache" / "video.mp4",
+            Path.home() / ".amplifier" / "video.mp4",
+        ]
+        for path in forbidden_paths:
+            with pytest.raises(ValidationError, match="D025"):
+                _check_d025(path)
+
+    async def test_veo_writes_video_to_output_path_on_complete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_write_video_bytes writes bytes to the expected path on disk.
+
+        D025 check is patched out so we can use tmp_path (which is under
+        $TMPDIR — a forbidden location per D025 but safe for unit tests).
+        """
+        import src.providers.veo_provider as veo_mod
+
+        # Bypass D025 check so tmp_path is usable
+        monkeypatch.setattr(veo_mod, "_check_d025", lambda p: None)
+
+        provider = VeoProvider("standard")
+        output_file = tmp_path / "test_video.mp4"
+        video_bytes = b"fake-video-content-bytes"
+
+        result_path = await provider._write_video_bytes(
+            video_bytes,
+            str(output_file),
+            "veo_standard_fallback.mp4",
+        )
+
+        # File should exist at the resolved path
+        assert result_path.exists()
+        assert result_path.read_bytes() == video_bytes
+
+    async def test_write_video_bytes_creates_parent_dirs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_write_video_bytes creates missing parent directories."""
+        import src.providers.veo_provider as veo_mod
+
+        monkeypatch.setattr(veo_mod, "_check_d025", lambda p: None)
+
+        provider = VeoProvider("lite")
+        deep_path = tmp_path / "a" / "b" / "c" / "video.mp4"
+
+        result_path = await provider._write_video_bytes(
+            b"bytes",
+            str(deep_path),
+            "fallback.mp4",
+        )
+
+        assert result_path.exists()
+        assert result_path.read_bytes() == b"bytes"
+
+    def test_safe_path_passes_d025_check(self) -> None:
+        """A path under ~/Downloads/videos passes the D025 check without error."""
+        from src.providers.veo_provider import _check_d025  # type: ignore
+
+        safe_path = Path.home() / "Downloads" / "videos" / "standard" / "video.mp4"
+        # Should not raise
+        _check_d025(safe_path)
+
+
+# ---------------------------------------------------------------------------
+# Sora Provider Tests  (unchanged — still stubs per DECISIONS D010)
+# ---------------------------------------------------------------------------
 
 
 class TestSoraRaisesNotImplemented:
@@ -212,9 +657,9 @@ class TestSoraRaisesNotImplemented:
         assert len(caps.supported_durations) > 0
 
 
-# ============================
-# Grok Provider Tests
-# ============================
+# ---------------------------------------------------------------------------
+# Grok Provider Tests  (unchanged — still stubs per DECISIONS D019)
+# ---------------------------------------------------------------------------
 
 
 class TestGrokRaisesNotImplemented:
@@ -242,9 +687,9 @@ class TestGrokRaisesNotImplemented:
         assert caps.name == "grok-imagine-video"
 
 
-# ============================
+# ---------------------------------------------------------------------------
 # Registry Tests
-# ============================
+# ---------------------------------------------------------------------------
 
 
 class TestRegistryGetProvider:
@@ -300,7 +745,14 @@ class TestRegistryGetProviderForJobUnknownRaises:
             registry.get_provider_for_job("totally_nonexistent_job_xyz_12345")  # type: ignore
         assert "not found" in str(exc_info.value).lower()
 
-    async def test_known_job_id_returns_provider(self) -> None:
+    async def test_known_job_id_returns_provider(
+        self, mock_sdk: MagicMock, sync_to_thread: None
+    ) -> None:
+        """After a successful submit, the registry can route the job_id."""
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-standard/operations/registry-routing"
+        mock_sdk.models.generate_videos.return_value = mock_operation
+
         registry = ProviderRegistry()
         provider = registry.get_provider("veo-3.1-standard")
         result = await provider.submit("Test prompt for job routing")  # type: ignore
