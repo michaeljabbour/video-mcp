@@ -1,0 +1,9 @@
+{
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "venvPath": "/Users/michaeljabbour/dev/video-mcp",
+  "venv": "venv",
+  "reportMissingModuleSource": "none",
+  "reportMissingImports": "none",
+  "extraPaths": ["/Users/michaeljabbour/dev/video-mcp"]
+}

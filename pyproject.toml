@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-mcp"
+version = "0.1.0"
+authors = [
+  { name="Michael Jabbour", email="michael@example.com" },
+]
+description = "MCP server for multi-provider video generation. Wraps Google Veo 3.1 (primary), xAI Grok Imagine Video (stub, gated), and OpenAI Sora 2 (stub, deprecation-only)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "fastmcp>=2.12.5,<3.0",
+    "pydantic>=2.0",
+    "httpx>=0.24.0",
+    "python-dotenv>=1.0.0",
+    "google-genai>=1.73.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.3.0",
+    "pyright>=1.1.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = []
+
+[tool.pyright]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+reportMissingModuleSource = "none"
+reportMissingImports = "warning"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
