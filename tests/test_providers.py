@@ -248,12 +248,15 @@ class TestVeoSubmitWithSDK:
         result = await provider.submit("A short clip", duration=4.0)
         assert result.duration_seconds == 4.0
 
-    async def test_submit_passes_model_key_to_sdk(
+    async def test_submit_passes_mapped_sdk_model_id_to_sdk(
         self, mock_sdk: MagicMock, sync_to_thread: None
     ) -> None:
-        """submit() passes the tier model key as 'model' to generate_videos()."""
+        """submit() resolves the tier key → SDK model ID via VEO_SDK_MODEL_IDS and passes
+        the resolved ID (not the raw tier key) to generate_videos()."""
+        from src.config.constants import VEO_SDK_MODEL_IDS  # type: ignore
+
         mock_operation = MagicMock()
-        mock_operation.name = "models/veo-3.1-standard/operations/model-check"
+        mock_operation.name = "models/veo-3.1-generate-preview/operations/model-check"
         mock_sdk.models.generate_videos.return_value = mock_operation
 
         provider = VeoProvider("standard")
@@ -261,7 +264,45 @@ class TestVeoSubmitWithSDK:
 
         call_kwargs = mock_sdk.models.generate_videos.call_args
         assert call_kwargs is not None
-        assert call_kwargs.kwargs.get("model") == "veo-3.1-standard"
+        # Must be the SDK-accepted model ID, NOT the raw tier key "veo-3.1-standard"
+        assert call_kwargs.kwargs.get("model") == "veo-3.1-generate-preview"
+        assert call_kwargs.kwargs.get("model") == VEO_SDK_MODEL_IDS["veo-3.1-standard"]
+
+    async def test_submit_maps_fast_tier_to_sdk_model_id(
+        self, mock_sdk: MagicMock, sync_to_thread: None
+    ) -> None:
+        """submit() maps veo-3.1-fast tier key to its distinct SDK model ID."""
+        from src.config.constants import VEO_SDK_MODEL_IDS  # type: ignore
+
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-fast-generate-preview/operations/fast-check"
+        mock_sdk.models.generate_videos.return_value = mock_operation
+
+        provider = VeoProvider("fast")
+        await provider.submit("Check fast tier model ID")
+
+        call_kwargs = mock_sdk.models.generate_videos.call_args
+        assert call_kwargs is not None
+        assert call_kwargs.kwargs.get("model") == "veo-3.1-fast-generate-preview"
+        assert call_kwargs.kwargs.get("model") == VEO_SDK_MODEL_IDS["veo-3.1-fast"]
+
+    async def test_submit_maps_lite_tier_to_sdk_model_id(
+        self, mock_sdk: MagicMock, sync_to_thread: None
+    ) -> None:
+        """submit() maps veo-3.1-lite tier key to its distinct SDK model ID."""
+        from src.config.constants import VEO_SDK_MODEL_IDS  # type: ignore
+
+        mock_operation = MagicMock()
+        mock_operation.name = "models/veo-3.1-lite-generate-preview/operations/lite-check"
+        mock_sdk.models.generate_videos.return_value = mock_operation
+
+        provider = VeoProvider("lite")
+        await provider.submit("Check lite tier model ID")
+
+        call_kwargs = mock_sdk.models.generate_videos.call_args
+        assert call_kwargs is not None
+        assert call_kwargs.kwargs.get("model") == "veo-3.1-lite-generate-preview"
+        assert call_kwargs.kwargs.get("model") == VEO_SDK_MODEL_IDS["veo-3.1-lite"]
 
     async def test_submit_auth_error_mapped_to_authentication_error(
         self, mock_sdk: MagicMock, monkeypatch: pytest.MonkeyPatch

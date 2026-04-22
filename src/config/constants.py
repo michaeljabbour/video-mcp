@@ -11,7 +11,7 @@ and stub-provider notices.
 
 VIDEO_MCP_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"  # Veo via Gemini API
 
-# Veo 3.1 tier identifiers (as passed to google-genai SDK when we wire live)
+# Veo 3.1 tier identifiers (our canonical tier keys — used in VEO_MODELS and VEO_SDK_MODEL_IDS)
 VEO_MODELS: dict[str, dict[str, object]] = {
     "veo-3.1-standard": {
         "marketing_name": "Veo 3.1 Standard",
@@ -37,6 +37,31 @@ VEO_MODELS: dict[str, dict[str, object]] = {
 }
 
 DEFAULT_VIDEO_MODEL = "veo-3.1-standard"
+
+# ---------------------------------------------------------------------------
+# Veo SDK model-ID mapping  (D015/D021)
+# ---------------------------------------------------------------------------
+# Maps our tier keys → the model strings accepted by client.models.generate_videos().
+#
+# CASE A — three separate model IDs, confirmed by two independent sources:
+#
+#   1. models.list() against the live Gemini Developer API (probed 2026-04-21):
+#        models/veo-3.1-generate-preview        → display_name "Veo 3.1"
+#        models/veo-3.1-fast-generate-preview   → display_name "Veo 3.1 fast"
+#        models/veo-3.1-lite-generate-preview   → display_name "Veo 3.1 lite"
+#
+#   2. SDK test file (google/genai/tests/models/test_generate_videos.py v1.73.1):
+#        VEO_MODEL_LATEST = "veo-3.1-generate-preview"  (canonical form, no "models/" prefix)
+#
+# The SDK normalises the "models/" prefix internally; we store the bare string
+# (matching SDK test conventions).  VeoProvider.submit() looks up this dict and
+# raises ConfigurationError if the tier key is absent — defence-in-depth (should
+# never occur because VEO_MODELS and VEO_SDK_MODEL_IDS are kept in sync here).
+VEO_SDK_MODEL_IDS: dict[str, str] = {
+    "veo-3.1-standard": "veo-3.1-generate-preview",
+    "veo-3.1-fast": "veo-3.1-fast-generate-preview",
+    "veo-3.1-lite": "veo-3.1-lite-generate-preview",
+}
 
 # ============================
 # Stubbed Providers

@@ -12,11 +12,12 @@ Architecture notes (Phase 2a.2):
 - D024 billing reminder is logged once per provider instance on first submit().
 
 SDK DISCREPANCIES (reported — not silently resolved):
-  1. Model IDs: constants.py uses veo-3.1-standard / veo-3.1-fast / veo-3.1-lite but
-     the SDK's own test file confirms the live API model ID is "veo-3.1-generate-preview"
-     (VEO_MODEL_LATEST in tests/models/test_generate_videos.py). The constants keys are
-     passed as-is per spec instruction ("model = canonical Veo tier ID from VEO_MODELS").
-     A mapping table will be needed before hitting the live API. See DECISIONS tracker.
+  1. Model IDs: RESOLVED via VEO_SDK_MODEL_IDS mapping in constants.py (D015/D021).
+     Probe confirmed three separate SDK model IDs for Veo 3.1:
+       veo-3.1-standard → "veo-3.1-generate-preview"
+       veo-3.1-fast     → "veo-3.1-fast-generate-preview"
+       veo-3.1-lite     → "veo-3.1-lite-generate-preview"
+     submit() now looks up VEO_SDK_MODEL_IDS[self._model_key] before the SDK call.
   2. operations.get() signature: spec documents client.operations.get(name=job_id) but
      the installed SDK (v1.73.1) accepts client.operations.get(operation: T) where T is
      a GenerateVideosOperation instance. We reconstruct the object from the stored name.
@@ -37,7 +38,7 @@ from typing import Any
 
 import httpx
 
-from ..config.constants import SUPPORTED_DURATIONS_SECONDS, VEO_MODELS
+from ..config.constants import SUPPORTED_DURATIONS_SECONDS, VEO_MODELS, VEO_SDK_MODEL_IDS
 from ..config.paths import resolve_output_path
 from ..config.settings import get_settings
 from ..exceptions import (
@@ -435,9 +436,23 @@ class VeoProvider(VideoProvider):
         _import_dependencies()
         config = genai_types.GenerateVideosConfig(**config_kwargs)
 
+        # Resolve our tier key → the SDK-accepted model ID (D015/D021 mapping).
+        # ConfigurationError is defence-in-depth; the key is always present because
+        # VEO_MODELS and VEO_SDK_MODEL_IDS are kept in sync in constants.py.
+        sdk_model_id = VEO_SDK_MODEL_IDS.get(self._model_key)
+        if sdk_model_id is None:
+            raise ConfigurationError(
+                f"No SDK model ID mapping found for tier '{self._model_key}'. "
+                "This is an internal error — update VEO_SDK_MODEL_IDS in constants.py.",
+                user_message=(
+                    f"Video tier '{self._model_key}' is not properly configured. "
+                    "Please report this issue."
+                ),
+            )
+
         # Build generate_videos call arguments
         call_kwargs: dict[str, Any] = {
-            "model": self._model_key,
+            "model": sdk_model_id,
             "prompt": prompt,
             "config": config,
         }
